@@ -248,7 +248,31 @@ def main():
     )
 
     # 手动执行训练步骤，显示详细进度
+    logger.info("开始执行训练...")
+
+    # 添加更详细的进度跟踪
+    import time
+
+    start_time = time.time()
+
+    # 获取模型设备信息
+    try:
+        device = next(model.parameters()).device
+        logger.info(f"模型设备: {device}")
+    except:
+        logger.info("无法获取模型设备信息")
+
+    # 计算参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"模型总参数: {total_params:,}")
+    logger.info(f"可训练参数: {trainable_params:,}")
+
+    logger.info("开始调用trainer.train()...")
     train_result = trainer.train()
+
+    end_time = time.time()
+    logger.info(f"训练总耗时: {end_time - start_time:.2f}秒")
 
     # 显示训练结果
     logger.info("训练完成！")
