@@ -17,18 +17,10 @@ from datasets import Dataset  # 加载预置数据集和创建自定义数据集
 # 主要作用：加载和训练Transformer架构的NLP模型
 from transformers import AutoModelForCausalLM  # 自动选择因果语言模型（如GPT系列）
 from transformers import AutoTokenizer  # 自动选择对应的分词器
+from transformers import TrainingArguments  # 训练参数配置类
+from peft import LoraConfig  # 参数高效微调库的LoRA配置
+from trl import SFTTrainer  # 监督微调训练器，专为语言模型优化
 
-# 基础用法：创建张量 tensor = torch.tensor([1, 2, 3])
-# 主要作用：提供GPU加速的张量运算和自动求导功能
-
-# PEFT(Parameter-Efficient Fine-Tuning)主要用于在少量数据上高效微调大模型
-# LoRA(Low-Rank Adaptation)通过添加小规模适配器层实现高效微调
-# 基础用法：config = LoraConfig(r=16, lora_alpha=32)
-
-
-# TRL(Transformer Reinforcement Learning)库的监督微调工具
-# 基础用法：trainer = SFTTrainer(model, dataset, args=training_args)
-# 主要作用：简化语言模型监督微调流程，支持各种训练技巧
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +37,13 @@ def setup_logging():
 def load_model_and_tokenizer(model_name="microsoft/Phi-3.5-mini-instruct"):
     """加载模型和tokenizer"""
 
-    # 模型配置参数
+    # 模型配置参数 - M2芯片优化配置
     model_kwargs = {
         "use_cache": False,  # 训练时关闭KV缓存，节省内存；推理时可设为True加速
         "trust_remote_code": True,  # 信任模型的远程代码，某些自定义模型架构需要
-        "dtype": torch.bfloat16,  # 使用bfloat16精度，减少显存占用，精度损失比float16小
-        "device_map": "auto",  # 自动将模型层分布到可用设备(CPU/GPU)，支持大模型分层加载
+        "torch_dtype": torch.float16,  # 使用float16精度，M2芯片支持
+        # M2芯片特殊配置：不要使用device_map="auto"
+        # device_map="auto",  # 注释掉，M2芯片会有设备不匹配问题
         "attn_implementation": "eager",  # 使用eager attention避免flash attention警告
     }
 
@@ -62,6 +55,13 @@ def load_model_and_tokenizer(model_name="microsoft/Phi-3.5-mini-instruct"):
 
     # 加载预训练的语言模型
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    # M2芯片：手动移动模型到MPS设备
+    if torch.backends.mps.is_available():
+        model = model.to("mps")
+        logger.info("模型已移动到MPS设备（M2芯片）")
+    else:
+        logger.info("使用CPU训练")
 
     return model, tokenizer
 
@@ -143,18 +143,16 @@ def prepare_dataset(tokenizer, data_path=None, use_sample_data=True):
     # 从Alpaca格式 {"instruction": "...", "input": "...", "output": "..."}
     # 转换为聊天格式 [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
     messages_data = convert_alpaca_to_messages_format(data_path)
-    logger.info(f"message_data: {len(messages_data)} items")
 
     # 步骤3：创建Hugging Face数据集对象
     raw_dataset = Dataset.from_list(messages_data)  # 把Python列表转为HF数据集格式
-    logger.info(f"raw_dataset: {raw_dataset}")
 
     # 步骤4：定义内部函数 - 应用聊天模板
     def apply_chat_template(example):
         example["text"] = tokenizer.apply_chat_template(
-            example["messages"],  # 聊天消息列表
-            tokenize=False,  # 不进行分词，返回字符串
-            add_generation_prompt=False,  # 不添加生成提示符
+            example["messages"],  # 输入：聊天消息列表
+            tokenize=False,  # 处理：不进行分词，返回字符串
+            add_generation_prompt=False,  # 返回：不添加生成提示符
         )
         return example
 
@@ -163,6 +161,7 @@ def prepare_dataset(tokenizer, data_path=None, use_sample_data=True):
         apply_chat_template,  # 对每个样本应用这个函数
         remove_columns=raw_dataset.column_names,  # 删除原来的"messages"列，只保留"text"列
     )
+    logger.info(f"process data:{processed_dataset}")
 
     # 步骤6：分割数据集
     if len(processed_dataset) > 1:  # 如果数据多于1条
@@ -181,13 +180,98 @@ def prepare_dataset(tokenizer, data_path=None, use_sample_data=True):
 def main():
     setup_logging()
 
+    # 加载模型和数据
     model, tokenizer = load_model_and_tokenizer()
     data_path = create_sample_alpaca_data()
-    # data = convert_alpaca_to_messages_format(data_path)
-    # logger.info(data)
+    train_dataset, eval_dataset = prepare_dataset(tokenizer, data_path)
 
-    data = prepare_dataset(tokenizer, data_path)
-    logger.info(data)
+    # 训练配置 - M2芯片优化
+    training_config = {
+        # M2芯片不需要fp16，因为MPS有自己的优化
+        # "fp16": True,  # 注释掉，避免MPS设备冲突
+        "do_eval": True,
+        "learning_rate": 5.0e-06,
+        "log_level": "info",
+        "logging_steps": 1,
+        "logging_strategy": "steps",
+        "lr_scheduler_type": "cosine",
+        "num_train_epochs": 3,
+        "max_steps": -1,
+        "output_dir": "./phi_checkpoint",
+        "overwrite_output_dir": True,
+        "per_device_eval_batch_size": 1,  # 减小批次，避免内存问题
+        "per_device_train_batch_size": 1,  # 减小批次，避免内存问题
+        "remove_unused_columns": True,
+        "save_steps": 1,  # 每步都保存，能看到进度
+        "save_total_limit": 3,  # 保存更多检查点
+        "seed": 42,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "gradient_accumulation_steps": 4,
+        "warmup_ratio": 0.1,
+        "eval_strategy": "steps",
+        "eval_steps": 1,  # 匹配save_steps
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+    }
+
+    # LoRA配置
+    peft_config = {
+        "r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.05,
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save": None,
+    }
+
+    # 创建训练参数
+    training_args = TrainingArguments(**training_config)
+    peft_args = LoraConfig(**peft_config)
+
+    # 创建训练器
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        peft_config=peft_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
+    # 开始训练
+    logger.info("开始训练...")
+    logger.info(f"训练数据大小: {len(train_dataset)}")
+    logger.info(f"验证数据大小: {len(eval_dataset) if eval_dataset else 0}")
+    logger.info(
+        f"总训练步数: {trainer.args.max_steps if trainer.args.max_steps > 0 else 'auto'}"
+    )
+
+    # 手动执行训练步骤，显示详细进度
+    train_result = trainer.train()
+
+    # 显示训练结果
+    logger.info("训练完成！")
+    logger.info(f"最终训练损失: {train_result.training_loss:.6f}")
+    logger.info(f"总训练步数: {train_result.global_step}")
+
+    # 记录训练指标
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+
+    # 保存模型
+    trainer.save_model()
+    logger.info(f"模型已保存到 {training_args.output_dir}")
+
+    # 如果有验证集，进行评估
+    if eval_dataset is not None:
+        logger.info("开始评估...")
+        tokenizer.padding_side = "left"  # 评估时用左侧填充
+        eval_metrics = trainer.evaluate()
+        eval_metrics["eval_samples"] = len(eval_dataset)
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
 
 
 if __name__ == "__main__":
