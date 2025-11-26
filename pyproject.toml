@@ -10,4 +10,7 @@ dependencies = [
     "transformers>=4.46.0", # 显式声明transformers，确保版本可控
     "peft>=0.18.0",
     "trl>=0.25.1",
+    "black>=25.11.0",
+    "ruff>=0.14.6",
+    "isort>=7.0.0",
 ]
