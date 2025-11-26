@@ -33,71 +33,86 @@ from trl import SFTTrainer  # 监督微调训练器，专为语言模型优化
 # 基础用法：trainer = SFTTrainer(model, dataset, args=training_args)
 # 主要作用：简化语言模型监督微调流程，支持各种训练技巧
 
-def main():
-    print("Hello from qc-train-phi!")
 
-    # ==================== 基础用法示例 ====================
+def setup_logging():
+    """设置日志"""
+    import logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
 
-    # 1. PyTorch 张量操作示例
-    print("\n=== PyTorch 基础用法 ===")
-    # 创建张量
-    tensor_data = torch.tensor([[1, 2, 3], [4, 5, 6]])
-    print(f"创建张量:\n{tensor_data}")
+def load_model_and_tokenizer(model_name="microsoft/Phi-3.5-mini-instruct"):
+    """加载模型和tokenizer"""
 
-    # GPU检查（如果可用）
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用设备: {device}")
-
-    # 2. 数据集加载示例
-    print("\n=== Datasets 基础用法 ===")
-    # 创建示例数据集
-    sample_data = {
-        "text": ["你好世界", "机器学习很有趣", "人工智能改变生活"],
-        "label": [1, 0, 1]
+    # 模型配置参数
+    model_kwargs = {
+        "use_cache": False,        # 训练时关闭KV缓存，节省内存；推理时可设为True加速
+        "trust_remote_code": True, # 信任模型的远程代码，某些自定义模型架构需要
+        "torch_dtype": torch.bfloat16,  # 使用bfloat16精度，减少显存占用，精度损失比float16小
+        "device_map": "auto"       # 自动将模型层分布到可用设备(CPU/GPU)，支持大模型分层加载
     }
-    dataset = Dataset.from_dict(sample_data)
-    print(f"数据集大小: {len(dataset)}")
-    print(f"第一条数据: {dataset[0]}")
 
-    # 3. Transformers 模型加载示例
-    print("\n=== Transformers 基础用法 ===")
-    # 注意：这里只是示例，实际运行需要下载模型
-    try:
-        # 加载一个小模型作为示例
-        model_name = "microsoft/DialoGPT-small"  # 小型对话模型
-        print(f"尝试加载模型: {model_name}")
-        # tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # model = AutoModelForCausalLM.from_pretrained(model_name)
-        print("模型加载示例代码已准备，实际运行时会下载模型")
-    except Exception as e:
-        print(f"模型加载示例跳过: {e}")
+    # 加载tokenizer（文本预处理工具）
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.unk_token  # 如果没有填充token，用未知token代替
+    tokenizer.padding_side = 'right'  # 在序列右侧进行填充，符合训练惯例
 
-    # 4. LoRA配置示例
-    print("\n=== PEFT LoRA 配置示例 ===")
-    lora_config = LoraConfig(
-        r=16,  # LoRA注意力矩阵的秩
-        lora_alpha=32,  # 缩放参数
-        target_modules=["q_proj", "v_proj"],  # 应用LoRA的模块
-        lora_dropout=0.1,  # dropout率
-        bias="none",  # bias设置
-        task_type="CAUSAL_LM"  # 任务类型
-    )
-    print(f"LoRA配置创建完成: {lora_config}")
+    # 加载预训练的语言模型
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
-    # 5. 训练参数配置示例
-    print("\n=== 训练参数配置示例 ===")
-    training_args = TrainingArguments(
-        output_dir="./results",  # 输出目录
-        num_train_epochs=3,  # 训练轮数
-        per_device_train_batch_size=4,  # 每设备批次大小
-        warmup_steps=100,  # 预热步数
-        weight_decay=0.01,  # 权重衰减
-        logging_dir="./logs",  # 日志目录
-        learning_rate=5e-5,  # 学习率
-    )
-    print(f"训练参数配置: {training_args}")
+    return model, tokenizer
 
-    print("\n=== 基础用法示例完成 ===")
+
+def create_sample_alpaca_data():
+    """创建示例Alpaca格式数据"""
+    
+    alpaca_data = [
+        {
+            "instruction": "写一个Python函数计算斐波那契数列",
+            "input": "",
+            "output": "def fibonacci(n):\n    if n <= 1:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)"
+        },
+        {
+            "instruction": "将以下英文翻译成中文",
+            "input": "The weather is really nice today, let's go for a walk.",
+            "output": "今天天气真好，我们出去散步吧。"
+        },
+        {
+            "instruction": "解释机器学习的基本概念",
+            "input": "",
+            "output": "机器学习是人工智能的一个分支，它使计算机能够在没有明确编程的情况下学习和改进。"
+        },
+        {
+            "instruction": "写一封求职信",
+            "input": "申请软件工程师职位，有3年Python经验",
+            "output": "尊敬的招聘经理：\n\n我写信申请贵公司的软件工程师职位...\n\n此致\n敬礼"
+        },
+        {
+            "instruction": "总结以下文章的主要内容",
+            "input": "人工智能正在改变世界。从医疗诊断到自动驾驶，AI技术正在各个领域产生深远影响...",
+            "output": "文章主要讨论了人工智能技术在各行各业的广泛应用和深远影响。"
+        }
+    ]
+    
+    # 保存为JSON文件
+    os.makedirs("./data", exist_ok=True)
+    with open("./data/alpaca_sample.json", "w", encoding="utf-8") as f:
+        json.dump(alpaca_data, f, ensure_ascii=False, indent=2)
+    
+    return "./data/alpaca_sample.json"
+
+
+def main():
+    setup_logging()
+    load_model_and_tokenizer()
+    create_sample_alpaca_data()
+
+
+
+
 
 
 if __name__ == "__main__":
