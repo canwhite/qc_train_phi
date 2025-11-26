@@ -1,6 +1,7 @@
 # ==================== 标准库 ====================
 import os  # 操作系统接口，用于文件路径操作和环境变量获取
 import json  # JSON数据处理库，用于配置文件和数据序列化
+import logging
 
 # ==================== AI训练相关核心包 ====================
 import torch  # PyTorch深度学习框架，用于张量计算和神经网络训练
@@ -36,7 +37,6 @@ from trl import SFTTrainer  # 监督微调训练器，专为语言模型优化
 
 def setup_logging():
     """设置日志"""
-    import logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -52,6 +52,7 @@ def load_model_and_tokenizer(model_name="microsoft/Phi-3.5-mini-instruct"):
         "trust_remote_code": True, # 信任模型的远程代码，某些自定义模型架构需要
         "torch_dtype": torch.bfloat16,  # 使用bfloat16精度，减少显存占用，精度损失比float16小
         "device_map": "auto"       # 自动将模型层分布到可用设备(CPU/GPU)，支持大模型分层加载
+        # 一个问题，默认的eager和flash attention2的区别
     }
 
     # 加载tokenizer（文本预处理工具）
@@ -104,11 +105,42 @@ def create_sample_alpaca_data():
     
     return "./data/alpaca_sample.json"
 
+def convert_alpaca_to_messages_format(data_path):
+    """将Alpaca格式转换为消息格式"""
+    
+    # 加载数据
+    with open(data_path, "r", encoding="utf-8") as f:
+        alpaca_data = json.load(f)
+    
+    messages_data = []
+    
+    for example in alpaca_data:
+        # 构建用户消息
+        user_content = example["instruction"]
+        if example.get("input", "").strip():
+            user_content += "\n" + example["input"]
+        
+        # 构建消息格式
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": example["output"]}
+        ]
+        
+        messages_data.append({"messages": messages})
+    
+    return messages_data
+
+
 
 def main():
     setup_logging()
-    load_model_and_tokenizer()
-    create_sample_alpaca_data()
+    logger = logging.getLogger(__name__)
+    model, tokenizer = load_model_and_tokenizer()
+    dic = create_sample_alpaca_data()
+    data = convert_alpaca_to_messages_format(dic)
+
+    logger.info(data)
+
 
 
 
